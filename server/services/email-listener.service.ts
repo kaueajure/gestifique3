@@ -112,6 +112,10 @@ function getForwardingConfirmationHosts(): Set<string> {
   return new Set((env.FORWARDING_CONFIRMATION_ALLOWED_HOSTS || []).map(host => host.toLowerCase()));
 }
 
+function isAllowedForwardingHost(url: URL): boolean {
+  return url.protocol === 'https:' && getForwardingConfirmationHosts().has(url.hostname.toLowerCase());
+}
+
 const GOOGLE_FORWARDING_CONFIRMATION_HOSTS = new Set([
   'mail.google.com',
   'mail-settings.google.com',
@@ -216,10 +220,8 @@ function isAllowedForwardingConfirmationUrl(value: string): string | null {
 
   try {
     const url = new URL(normalized);
-    const host = url.hostname.toLowerCase();
-    const allowedHosts = getForwardingConfirmationHosts();
 
-    if (url.protocol !== 'https:' || !allowedHosts.has(host)) {
+    if (!isAllowedForwardingHost(url)) {
       return null;
     }
 
@@ -317,10 +319,8 @@ export class EmailListenerService {
       return;
     }
 
-    // Connect and start IDLE
     this.connect();
 
-    // Heartbeat Cron: Run every 15 minutes to ensure connection is alive
     cron.schedule('*/15 * * * *', async () => {
       console.log('[Email Listener] Heartbeat check...');
       if (!this.connection || !this.connection.imap || this.connection.imap.state === 'disconnected') {
@@ -347,20 +347,16 @@ export class EmailListenerService {
     try {
       console.log('[IMAP] Tentando conectar à caixa de entrada (IDLE mode)...');
       this.connection = await imaps.connect(config);
-      
       await this.connection.openBox('INBOX');
       console.log('[IMAP] Ligação estabelecida e IDLE ativo.');
 
-      // Process existing unseen emails on startup
       await this.processInbox();
 
-      // Listen for new mail
       this.connection.imap.on('mail', (numNewMsgs: number) => {
         console.log(`[IMAP IDLE] ⚡ ${numNewMsgs} novo(s) e-mail(s) detectado(s) em tempo real!`);
         this.processInbox();
       });
 
-      // Handle connection issues
       this.connection.imap.on('error', (err: any) => {
         console.error('[IMAP ERROR] Erro na conexão imap:', err);
         this.reconnect();
@@ -370,7 +366,6 @@ export class EmailListenerService {
         console.warn('[IMAP WARN] Conexão encerrada pelo servidor.');
         this.reconnect();
       });
-
     } catch (e) {
       console.error('[IMAP ERROR] Falha ao conectar:', e);
       this.reconnect();
@@ -472,54 +467,69 @@ export class EmailListenerService {
   private static async confirmForwardingUrl(url: string): Promise<{ success: boolean; status?: number; finalUrl?: string; error?: string }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
+    const maxRedirects = 5;
 
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        redirect: 'follow',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Gestifique-Forwarding-Confirmation/1.0',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-      });
-      const finalUrl = response.url || url;
-      const finalHost = new URL(finalUrl).hostname.toLowerCase();
-      const finalHostAllowed = getForwardingConfirmationHosts().has(finalHost);
-      const body = await response.text().catch(() => '');
+      let currentUrl = url;
 
-      if (!finalHostAllowed) {
-        return {
-          success: false,
-          status: response.status,
-          finalUrl,
-          error: `Redirecionado para host nao permitido (${finalHost}).`,
-        };
+      for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
+        const parsedCurrent = new URL(currentUrl);
+        if (!isAllowedForwardingHost(parsedCurrent)) {
+          return { success: false, finalUrl: currentUrl, error: `Host/protocolo nao permitido (${parsedCurrent.hostname}).` };
+        }
+
+        const response = await fetch(currentUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: {
+            'User-Agent': 'Gestifique-Forwarding-Confirmation/1.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        });
+
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+          const location = response.headers.get('location');
+          if (!location) {
+            return { success: false, status: response.status, finalUrl: currentUrl, error: 'Redirect sem Location.' };
+          }
+          if (redirectCount >= maxRedirects) {
+            return { success: false, status: response.status, finalUrl: currentUrl, error: 'Limite de redirecionamentos excedido.' };
+          }
+
+          const nextUrl = new URL(location, currentUrl);
+          if (!isAllowedForwardingHost(nextUrl)) {
+            return {
+              success: false,
+              status: response.status,
+              finalUrl: nextUrl.toString(),
+              error: `Redirecionamento bloqueado antes da requisicao para host nao permitido (${nextUrl.hostname}).`,
+            };
+          }
+
+          currentUrl = nextUrl.toString();
+          continue;
+        }
+
+        const body = await response.text().catch(() => '');
+
+        if (response.status < 200 || response.status >= 400) {
+          return { success: false, status: response.status, finalUrl: currentUrl, error: `HTTP ${response.status}` };
+        }
+
+        if (responseLooksLikeInteractiveAuth(currentUrl, body)) {
+          return {
+            success: false,
+            status: response.status,
+            finalUrl: currentUrl,
+            error: 'O link exige login, senha, captcha ou outra acao interativa.',
+          };
+        }
+
+        return { success: true, status: response.status, finalUrl: currentUrl };
       }
 
-      if (response.status < 200 || response.status >= 400) {
-        return {
-          success: false,
-          status: response.status,
-          finalUrl,
-          error: `HTTP ${response.status}`,
-        };
-      }
-
-      if (responseLooksLikeInteractiveAuth(finalUrl, body)) {
-        return {
-          success: false,
-          status: response.status,
-          finalUrl,
-          error: 'O link exige login, senha, captcha ou outra acao interativa.',
-        };
-      }
-
-      return {
-        success: true,
-        status: response.status,
-        finalUrl,
-      };
+      return { success: false, finalUrl: currentUrl, error: 'Limite de redirecionamentos excedido.' };
     } catch (err: any) {
       return {
         success: false,
@@ -634,7 +644,6 @@ export class EmailListenerService {
           const senderName = fromObj?.name || senderEmail || 'Sem Nome';
           const subject = parsed.subject || 'Sem Assunto';
 
-          // 1. Identify recipient company/channel before any ticket lookup
           let targetTicketId: number | null = null;
           let targetEmpresaId: number | null = null;
           let matchedChannelId: number | null = null;
@@ -712,7 +721,6 @@ export class EmailListenerService {
           }
 
           const identifyTicket = async (companyId: number): Promise<{ ticketId: number | null; hadExplicitTicketReference: boolean; invalidTicketId?: number }> => {
-             // A) By X-Gestifique-Ticket-ID in headers, scoped to the recipient company
              const headerTicketIdStr = parsed.headers.get('x-gestifique-ticket-id');
              if (headerTicketIdStr && typeof headerTicketIdStr === 'string' && !isNaN(parseInt(headerTicketIdStr))) {
                 const id = parseInt(headerTicketIdStr);
@@ -726,7 +734,6 @@ export class EmailListenerService {
                 return { ticketId: null, hadExplicitTicketReference: true, invalidTicketId: id };
              }
 
-             // B) By [Ticket #ID], Chamado #ID, etc in subject, scoped to the recipient company
              const subjectMatch = subject.match(/(?:\[Ticket\s*#(\d+)\]|Chamado\s*#(\d+)|Ticket\s*#(\d+))/i);
              if (subjectMatch) {
                 const id = parseInt(subjectMatch[1] || subjectMatch[2] || subjectMatch[3]);
@@ -740,14 +747,9 @@ export class EmailListenerService {
                 return { ticketId: null, hadExplicitTicketReference: true, invalidTicketId: id };
              }
 
-             // C) Try pattern-based extraction on Message-ID / In-Reply-To / References, scoped to company
              const inReplyTo = parsed.inReplyTo;
              const references = Array.isArray(parsed.references) ? parsed.references : (parsed.references ? [parsed.references] : []);
-             const candidates = [
-               parsed.messageId,
-               inReplyTo,
-               ...references
-             ].filter(Boolean);
+             const candidates = [parsed.messageId, inReplyTo, ...references].filter(Boolean);
 
              for (const candidate of candidates) {
                const extractedTicketId = extractTicketIdFromGestifiqueMessageId(candidate);
@@ -763,7 +765,6 @@ export class EmailListenerService {
                }
              }
 
-             // D) By In-Reply-To or References headers inside processed_emails table, scoped to company
              const allRefs = [inReplyTo, ...references].filter((r): r is string => !!r);
              if (allRefs.length > 0) {
                 const [refMatch]: any = await pool.query(
@@ -847,12 +848,10 @@ export class EmailListenerService {
              );
           }
 
-          // 4. Anti-Loop & System Prevention
           const precedence = (parsed.headers.get('precedence') as string || '').toLowerCase();
           const autoSubmitted = (parsed.headers.get('auto-submitted') as string || '').toLowerCase();
           const isSystemHeader = parsed.headers.get('x-gestifique-system') === 'true';
 
-          // Better checks for system emails using normalized helpers
           const systemEmailsNormalized = [
             normalizeEmailAddress(env.IMAP.USER),
             normalizeEmailAddress(env.SMTP.USER),
@@ -874,7 +873,6 @@ export class EmailListenerService {
              continue;
           }
 
-          // Thread duplication prevention check for responses that look like Gestifique thread and have system indicators but no valid DB match
           if (!targetTicketId && looksLikeGestifiqueTicketThread(subject, parsed)) {
              console.warn(`[Email Listener] [UID:${uid}] Ignored email from ${maskEmail(senderEmail)} because it looks like a Gestifique ticket thread fallback replica without active matching ticket.`);
              await this.logSystem(targetEmpresaId, 'EMAIL_THREAD_REPLICA_IGNORED', `Email de ${maskEmail(senderEmail)} (Assunto: "${subject}") ignorado pois aparenta ser uma réplica antiga/inválida de thread sem ticket correspondente ativo.`);
@@ -883,24 +881,18 @@ export class EmailListenerService {
              continue;
           }
 
-          // 5. Resolve Sender Context
           const { userId } = await this.resolveSenderContext(senderEmail!, targetEmpresaId);
 
-          // 6. Cleanup Message Body
           let text = parsed.text || '';
-          // Common patterns to strip previous conversation
-          text = text.split(/Em \d+ de [a-zç]+ de \d{4}.*pelo Gestifique.*escreveu:/i)[0]; // Gestifique specific
-          text = text.split(/Em \d+ de \w+ de \d{4}.*escreveu:/i)[0]; // Generic Portuguese
-          text = text.split(/On .* wrote:/i)[0]; // Generic English
-          text = text.split(/\r?\n\s*-+\s*Mensagem original\s*-+\s*/i)[0]; // "Original Message" separator
-          text = text.split(/\r?\n\s*>+/)[0]; // Blockquote entries
+          text = text.split(/Em \d+ de [a-zç]+ de \d{4}.*pelo Gestifique.*escreveu:/i)[0];
+          text = text.split(/Em \d+ de \w+ de \d{4}.*escreveu:/i)[0];
+          text = text.split(/On .* wrote:/i)[0];
+          text = text.split(/\r?\n\s*-+\s*Mensagem original\s*-+\s*/i)[0];
+          text = text.split(/\r?\n\s*>+/)[0];
           text = text.trim();
-          
-          if (!text && parsed.text) text = parsed.text.trim(); // Safety fallback
+          if (!text && parsed.text) text = parsed.text.trim();
 
-          // 7. Handle Create or Update
           if (!targetTicketId) {
-             // Smart deduplication fallback (Subject + Sender in 48h) because identifyTicket didn't find matched tickets via header
              const [dupRows]: any = await pool.query(
                'SELECT id FROM tickets WHERE titulo = ? AND (solicitante_email = ? OR usuario_id = ?) AND empresa_id = ? AND deleted_at IS NULL AND created_at > (NOW() - INTERVAL 2 DAY) AND status != "fechado" ORDER BY created_at DESC LIMIT 1',
                [subject, senderEmail, userId, targetEmpresaId]
@@ -908,30 +900,27 @@ export class EmailListenerService {
              if (dupRows.length > 0) {
                 console.log(`[Email Listener] Identified duplicate ticket #${dupRows[0].id} via subject/sender matching.`);
                 targetTicketId = dupRows[0].id;
+             }
+          }
 
-              }
-           }
+          if (targetTicketId) {
+            const msgId = await ticketsService.addMessage({
+              ticket_id: targetTicketId,
+              usuario_id: userId || null,
+              mensagem: text,
+              interno: 0,
+              message_id: messageId,
+              empresa_id: targetEmpresaId
+            });
+            await this.attachProcessedEmailToTicket(claimedMessageKey, targetTicketId, targetEmpresaId);
 
-           if (targetTicketId) {
-              const msgId = await ticketsService.addMessage({
-                ticket_id: targetTicketId,
-                usuario_id: userId || null, // Allow system fallback down line if needed
-                mensagem: text,
-                interno: 0,
-                message_id: messageId,
-                empresa_id: targetEmpresaId
-              });
-              await this.attachProcessedEmailToTicket(claimedMessageKey, targetTicketId, targetEmpresaId);
+            await this.logSystem(targetEmpresaId, 'EMAIL_MESSAGE_ADDED', `Nova mensagem via e-mail no ticket #${targetTicketId} de ${maskEmail(senderEmail)}.`);
+            await this.processAttachments(parsed, targetTicketId, msgId, userId, targetEmpresaId);
 
-              await this.logSystem(targetEmpresaId, 'EMAIL_MESSAGE_ADDED', `Nova mensagem via e-mail no ticket #${targetTicketId} de ${maskEmail(senderEmail)}.`);
-
-              await this.processAttachments(parsed, targetTicketId, msgId, userId, targetEmpresaId);
-
-              // MARK AS SEEN ONLY ON SUCCESS
-              claimedMessageHandled = true;
-              await this.connection.addFlags(uid, '\\Seen');
-              console.log(`[Email Listener] [UID:${uid}] Ticket #${targetTicketId} updated and email marked as seen.`);
-           }
+            claimedMessageHandled = true;
+            await this.connection.addFlags(uid, '\\Seen');
+            console.log(`[Email Listener] [UID:${uid}] Ticket #${targetTicketId} updated and email marked as seen.`);
+          }
 
           if (!targetTicketId) {
             const newTicketId = await ticketsService.create({
@@ -944,22 +933,19 @@ export class EmailListenerService {
               prioridade: 'media',
               categoria: 'suporte',
               origem: 'email',
-              email_channel_id: matchedChannelId, 
+              email_channel_id: matchedChannelId,
               message_id: messageId
             });
 
             await this.attachProcessedEmailToTicket(claimedMessageKey, newTicketId, targetEmpresaId);
-
             await this.logSystem(targetEmpresaId, 'EMAIL_TICKET_CREATED', `Ticket #${newTicketId} criado via e-mail de ${maskEmail(senderEmail)}.`);
-            
+
             const newTicket = await ticketsService.getById(newTicketId);
             if (newTicket && io) {
                io.to(`empresa_${targetEmpresaId}`).emit('ticketCreated', newTicket);
             }
-            
-            await this.processAttachments(parsed, newTicketId, null, userId, targetEmpresaId);
 
-            // MARK AS SEEN ONLY ON SUCCESS
+            await this.processAttachments(parsed, newTicketId, null, userId, targetEmpresaId);
             claimedMessageHandled = true;
             await this.connection.addFlags(uid, '\\Seen');
             console.log(`[Email Listener] [UID:${uid}] Ticket #${newTicketId} created from email and marked as seen.`);
@@ -984,7 +970,6 @@ export class EmailListenerService {
     if (!parsed.attachments || parsed.attachments.length === 0) return;
 
     for (const att of parsed.attachments) {
-      // Basic security validation
       const originalName = att.filename || 'anexo_email.bin';
       const contentType = att.contentType || 'application/octet-stream';
       const contentValidation = validateAttachmentBuffer(att.content, originalName, contentType);
@@ -996,27 +981,24 @@ export class EmailListenerService {
 
       const forbiddenExts = ['.exe', '.bat', '.sh', '.js', '.vbs', '.scr', '.cmd'];
       const ext = path.extname(originalName).toLowerCase();
-      
+
       if (forbiddenExts.includes(ext)) {
          console.warn(`[Email Listener] Blocked dangerous attachment: ${originalName}`);
          await this.logSystem(empresaId, 'ATTACHMENT_BLOCKED', `Anexo perigoso bloqueado: ${originalName} no Ticket #${ticketId}.`);
          continue;
       }
 
-      // Max size check: 10MB
       if (att.size > 10 * 1024 * 1024) {
          console.warn(`[Email Listener] Attachment too large: ${originalName} (${att.size} bytes)`);
          await this.logSystem(empresaId, 'ATTACHMENT_REJECTED', `Anexo muito grande rejeitado: ${originalName} (${Math.round(att.size / 1024 / 1024)}MB).`);
          continue;
       }
 
-      // Small noise check (e.g. small tracking pixels or icons)
       if (att.size < 500) continue;
 
       try {
         const uniqueFilename = `email-${Date.now()}-${Math.round(Math.random() * 1E9)}${ext || '.bin'}`;
-        
-        // Usar StorageService em vez de fs direto
+
         const filePath = await storageService.save(att.content, {
           filename: uniqueFilename,
           mimeType: contentType
@@ -1034,7 +1016,7 @@ export class EmailListenerService {
           tamanho_bytes: att.size,
           interno: false
         });
-        
+
         console.log(`[Email Listener] Attachment saved: ${originalName}`);
       } catch (err) {
         console.error(`[Email Listener] Error processing attachment ${originalName}:`, err);
@@ -1043,22 +1025,19 @@ export class EmailListenerService {
   }
 
   static async resolveSenderContext(email: string, targetEmpresaId: number): Promise<{ userId: number | null }> {
-    // 1. Look for verified user in the target company
     const [rows]: any = await pool.query(
-      'SELECT id, empresa_id FROM usuarios WHERE email = ? AND ativo = 1', 
+      'SELECT id, empresa_id FROM usuarios WHERE email = ? AND ativo = 1',
       [email]
     );
 
     if (rows.length > 0) {
-      // Find matching company or first one if dev/global admin
       const match = rows.find((r: any) => r.empresa_id === targetEmpresaId);
       if (match) return { userId: match.id };
-      
-      // If user exists but in another company
+
       await this.logSystem(targetEmpresaId, 'EMAIL_SENDER_CROSS_COMPANY', `Email de ${maskEmail(email)} recebido, mas usuario pertence a empresa ${rows[0].empresa_id}. Tratado como externo.`);
       return { userId: null };
     }
-    
+
     return { userId: null };
   }
 }
