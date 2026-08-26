@@ -11,7 +11,6 @@ async function initDB() {
     connection = await pool.getConnection();
     console.log('[BOOT] ✅ Conexão estabelecida.');
 
-    // Migrations devem rodar em etapa controlada em producao.
     if (env.AUTO_RUN_MIGRATIONS) {
       console.log('[BOOT] AUTO_RUN_MIGRATIONS=true; executando migrations pendentes...');
       await runMigrations();
@@ -19,33 +18,28 @@ async function initDB() {
       console.log('[BOOT] AUTO_RUN_MIGRATIONS=false; execute npm run db:migrate antes do start em producao.');
     }
 
-    // Seed Initial Developer
-    const [devs]: any = await connection.query('SELECT id FROM usuarios WHERE desenvolvedor = 1 LIMIT 1');
-    if (devs.length === 0) {
-      if (env.DEV_EMAIL && env.DEV_PASSWORD) {
-        if (!isValidPassword(env.DEV_PASSWORD)) {
-          const message = `[BOOT] DEV_PASSWORD invalida para seed do desenvolvedor. ${PASSWORD_RULE_MESSAGE}`;
-          if (env.IS_PROD) {
-            throw new Error(message);
-          }
-          console.warn(`${message} Seed ignorado fora de producao.`);
-          return;
+    if (env.ENABLE_DEV_BOOTSTRAP) {
+      const [devs]: any = await connection.query('SELECT id FROM usuarios WHERE desenvolvedor = 1 LIMIT 1');
+      if (devs.length === 0) {
+        if (!env.DEV_EMAIL || !env.DEV_PASSWORD) {
+          throw new Error('[BOOT] ENABLE_DEV_BOOTSTRAP=true exige DEV_EMAIL e DEV_PASSWORD.');
         }
+        if (!isValidPassword(env.DEV_PASSWORD) || env.DEV_PASSWORD.length < 12) {
+          throw new Error(`[BOOT] DEV_PASSWORD invalida para seed do desenvolvedor. ${PASSWORD_RULE_MESSAGE} Use pelo menos 12 caracteres no bootstrap.`);
+        }
+
         console.log('[BOOT] 🌱 Semeando usuário desenvolvedor inicial...');
-        const hashedPassword = await bcrypt.hash(env.DEV_PASSWORD, 10);
-        
+        const hashedPassword = await bcrypt.hash(env.DEV_PASSWORD, 12);
+
         await connection.query(
           'INSERT INTO usuarios (nome, email, senha_hash, cargo, administrador, desenvolvedor) VALUES (?, ?, ?, ?, ?, ?)',
           ['Desenvolvedor Master', env.DEV_EMAIL, hashedPassword, 'System Developer', 1, 1]
         );
-        console.log(`[BOOT] ✅ Desenvolvedor inicial criado: ${env.DEV_EMAIL}`);
-      } else {
-        console.warn('[BOOT] ⚠️ DEV_EMAIL ou DEV_PASSWORD não definidos. Pulei o seed do desenvolvedor.');
+        console.log(`[BOOT] ✅ Desenvolvedor inicial criado: ${env.DEV_EMAIL}. Desative ENABLE_DEV_BOOTSTRAP após o primeiro acesso.`);
       }
     }
 
     console.log('[BOOT] ✨ Inicialização do banco concluída com sucesso.');
-
   } catch (error) {
     console.error('[BOOT] ❌ Erro ao inicializar banco de dados:', error);
     throw error;
