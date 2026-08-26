@@ -35,7 +35,6 @@ router.post('/webhook', async (req: Request, res: Response) => {
       return res.status(403).json({ success: false, message: 'Assinatura inválida' });
     }
 
-    // Responde 200 rapidamente (Meta exige resposta rápida).
     res.status(200).json({ success: true });
 
     const { processed } = await whatsappService.handleWebhookPayload(req.body);
@@ -52,23 +51,14 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
 router.use(authMiddleware as any);
 
-const META_CREDENTIALS_ALLOWED_EMAIL = 'kaueajure@gmail.com';
-
-function canViewMetaCredentials(email?: string | null): boolean {
-  return String(email || '').trim().toLowerCase() === META_CREDENTIALS_ALLOWED_EMAIL;
-}
-
 router.get(
   '/status',
   requirePermission('integracoes.whatsapp.visualizar', { allowDeveloper: true }),
-  async (req: AuthRequest, res: Response) => {
+  async (_req: AuthRequest, res: Response) => {
     try {
       const status = whatsappService.getPublicStatus();
-      if (canViewMetaCredentials(req.user?.email)) {
-        return sendSuccess(res, status);
-      }
 
-      // Demais usuários veem só o essencial da inbox — sem IDs/token/webhook.
+      // Nunca exponha IDs operacionais, preview de token, verify token ou callback ao frontend.
       return sendSuccess(res, {
         enabled: status.enabled,
         configured: status.configured,
@@ -182,7 +172,7 @@ router.post(
   requirePermission('integracoes.whatsapp.gerenciar', { allowDeveloper: true }),
   async (req: AuthRequest, res: Response) => {
     try {
-      if (!req.user) return sendError(res, 'Usu\u00e1rio n\u00e3o autenticado', 401);
+      if (!req.user) return sendError(res, 'Usuário não autenticado', 401);
       const data = await whatsappService.claimAttendance(String(req.params.phone || ''), {
         id: req.user.id,
         name: req.user.nome,
@@ -192,7 +182,7 @@ router.post(
       console.error('[WhatsApp] claim attendance error:', err);
       return sendError(
         res,
-        err?.message || 'N\u00e3o foi poss\u00edvel iniciar o atendimento',
+        err?.message || 'Não foi possível iniciar o atendimento',
         err?.status || 500,
       );
     }
@@ -223,7 +213,7 @@ router.post(
   async (req: AuthRequest, res: Response) => {
     try {
       const { to, text } = req.body || {};
-      if (!req.user) return sendError(res, 'Usu\u00e1rio n\u00e3o autenticado', 401);
+      if (!req.user) return sendError(res, 'Usuário não autenticado', 401);
       const data = await whatsappService.sendAgentTextMessage(to, text, {
         id: req.user.id,
         name: req.user.nome,
