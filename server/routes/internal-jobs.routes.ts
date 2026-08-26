@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Router } from 'express';
 import { env } from '../config/env.js';
 import { sendError, sendSuccess } from '../utils/response.js';
@@ -5,25 +6,22 @@ import { emailOutboxService, normalizeOutboxProcessLimit } from '../services/ema
 
 const router = Router();
 
-function getProvidedToken(req: any): { token: string; source: 'header' | 'query' | 'none' } {
-  const headerToken = String(req.headers['x-internal-job-token'] || '').trim();
-  if (headerToken) return { token: headerToken, source: 'header' };
+function timingSafeEqualString(a: string, b: string): boolean {
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+  if (aBuffer.length !== bBuffer.length) return false;
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
 
-  // Compatibilidade com cron simples da Hostinger. Use somente se headers customizados
-  // nao estiverem disponiveis, pois query string pode aparecer em logs de servidor.
-  if (env.ALLOW_INTERNAL_JOB_TOKEN_IN_QUERY && typeof req.query.token === 'string') {
-    return { token: req.query.token.trim(), source: 'query' };
-  }
-
-  return { token: '', source: 'none' };
+function getProvidedToken(req: any): string {
+  return String(req.headers['x-internal-job-token'] || '').trim();
 }
 
 function isAuthorized(req: any): boolean {
   const configuredToken = String(env.INTERNAL_JOB_TOKEN || '').trim();
-  if (!configuredToken) return false;
-
-  const provided = getProvidedToken(req);
-  return provided.token === configuredToken;
+  const providedToken = getProvidedToken(req);
+  if (!configuredToken || !providedToken) return false;
+  return timingSafeEqualString(providedToken, configuredToken);
 }
 
 async function processEmailOutbox(req: any, res: any) {
@@ -32,9 +30,8 @@ async function processEmailOutbox(req: any, res: any) {
   }
 
   try {
-    const limit = normalizeOutboxProcessLimit(req.body?.limit ?? req.query.limit ?? 20);
-    const tokenSource = getProvidedToken(req).source;
-    console.log(`[InternalJobs] Processando email outbox via ${req.method}; token_source=${tokenSource}; limit=${limit}`);
+    const limit = normalizeOutboxProcessLimit(req.body?.limit ?? 20);
+    console.log(`[InternalJobs] Processando email outbox via POST; limit=${limit}`);
     const result = await emailOutboxService.processPending(limit);
     return sendSuccess(res, result, 'Outbox processada');
   } catch (error) {
@@ -43,7 +40,7 @@ async function processEmailOutbox(req: any, res: any) {
   }
 }
 
+// Endpoint mutavel: apenas POST e token em header. Nunca aceite secret em query string.
 router.post('/process-email-outbox', processEmailOutbox);
-router.get('/process-email-outbox', processEmailOutbox);
 
 export default router;
