@@ -5,11 +5,9 @@ dotenv.config();
 process.env.TZ = process.env.APP_TIMEZONE || 'America/Sao_Paulo';
 
 const DEFAULT_FORWARDING_CONFIRMATION_ALLOWED_HOSTS = [
-  // Gmail / Google Workspace forwarding confirmations.
   'mail.google.com',
   'mail-settings.google.com',
   'isolated.mail.google.com',
-  // Yahoo Mail and AOL Mail forwarding confirmations.
   'login.yahoo.com',
   'mail.yahoo.com',
   'account.yahoo.com',
@@ -18,18 +16,14 @@ const DEFAULT_FORWARDING_CONFIRMATION_ALLOWED_HOSTS = [
   'mail.aol.com',
   'account.aol.com',
   'api.login.aol.com',
-  // Cloudflare Email Routing destination-address verification.
   'dash.cloudflare.com',
-  // Proton Mail forwarding invitations.
   'account.proton.me',
   'mail.proton.me',
   'proton.me',
-  // Squarespace domain email forwarding verification.
   'account.squarespace.com',
   'domains.squarespace.com',
   'squarespace.com',
   'www.squarespace.com',
-  // Zoho Mail uses verification codes and, in some regions, authenticated links.
   'accounts.zoho.com',
   'mail.zoho.com',
   'accounts.zoho.eu',
@@ -70,35 +64,55 @@ function parseNonNegativeIntEnv(name: string, fallback: number): number {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-// S6: validação de força do JWT_SECRET.
-// Rejeita segredo vazio, curto (< 32) ou igual a valores de exemplo conhecidos.
-// Em produção é fatal (aborta o boot); em desenvolvimento apenas avisa.
 const IS_PROD_BOOT = process.env.NODE_ENV === 'production';
-const WEAK_JWT_SECRETS = new Set([
-  'mudar-isso-em-producao-com-chave-longa-e-segura',
-  'secret',
-  'changeme',
-  'change-me',
-  'jwt_secret',
-  'your-secret-key',
-  'supersecret',
-]);
-(() => {
-  const secret = (process.env.JWT_SECRET || '').trim();
-  const isWeak = secret.length < 32 || WEAK_JWT_SECRETS.has(secret.toLowerCase());
-  if (!isWeak) return;
+const PLACEHOLDER_SECRET_PATTERNS = [
+  /^cole[_\s-]*aqui/i,
+  /^defina[_\s-]/i,
+  /change[_\s-]*me/i,
+  /changeme/i,
+  /^example/i,
+  /^your[_\s-]/i,
+  /^replace[_\s-]/i,
+  /mudar[_\s-]*isso/i,
+];
 
-  const reason = secret.length < 32
-    ? 'deve ter no mínimo 32 caracteres'
-    : 'não pode ser um valor de exemplo/conhecido';
+function isPlaceholderSecret(value: string): boolean {
+  const normalized = value.trim();
+  return PLACEHOLDER_SECRET_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function validateSecret(name: string, value: string | undefined, minLength = 32): void {
+  if (!value) return;
+
+  const secret = value.trim();
+  const weak = secret.length < minLength || isPlaceholderSecret(secret);
+  if (!weak) return;
+
+  const reason = secret.length < minLength
+    ? `deve ter no minimo ${minLength} caracteres`
+    : 'nao pode ser um valor de exemplo/placeholder';
 
   if (IS_PROD_BOOT) {
-    console.error(`CRITICAL ERROR: JWT_SECRET inseguro (${reason}). Defina um segredo forte e aleatório antes de subir em produção.`);
+    console.error(`CRITICAL ERROR: ${name} inseguro (${reason}). Gere um segredo aleatorio exclusivo para este ambiente.`);
     process.exit(1);
-  } else {
-    console.warn(`[SECURITY] ⚠️ JWT_SECRET inseguro (${reason}). Tolerado apenas em desenvolvimento; NUNCA use assim em produção.`);
   }
-})();
+
+  console.warn(`[SECURITY] ${name} inseguro (${reason}). Tolerado apenas fora de producao.`);
+}
+
+validateSecret('JWT_SECRET', process.env.JWT_SECRET, 32);
+validateSecret('INTERNAL_JOB_TOKEN', process.env.INTERNAL_JOB_TOKEN, 32);
+validateSecret('ENCRYPTION_KEY', process.env.ENCRYPTION_KEY, 32);
+
+const devBootstrapEnabled = process.env.ENABLE_DEV_BOOTSTRAP === 'true';
+if (devBootstrapEnabled) {
+  const email = String(process.env.DEV_EMAIL || '').trim();
+  const password = String(process.env.DEV_PASSWORD || '');
+  if (!email || password.length < 12 || isPlaceholderSecret(password)) {
+    console.error('CRITICAL ERROR: ENABLE_DEV_BOOTSTRAP=true exige DEV_EMAIL e DEV_PASSWORD forte (minimo 12 caracteres, sem placeholder).');
+    process.exit(1);
+  }
+}
 
 export const env = {
   NODE_ENV: process.env.NODE_ENV || 'development',
@@ -115,16 +129,15 @@ export const env = {
     CONNECT_TIMEOUT_MS: parsePositiveIntEnv('DB_CONNECT_TIMEOUT_MS', 10000),
   },
   IS_PROD: process.env.NODE_ENV === 'production',
-  CORS_ORIGINS: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : [],
+  CORS_ORIGINS: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean) : [],
+  ENABLE_DEV_BOOTSTRAP: devBootstrapEnabled,
   DEV_EMAIL: process.env.DEV_EMAIL,
   DEV_PASSWORD: process.env.DEV_PASSWORD,
   INBOUND_EMAIL_DOMAIN: process.env.INBOUND_EMAIL_DOMAIN || 'inbound.gestifique.com.br',
   INBOUND_EMAIL_PREFIX: process.env.INBOUND_EMAIL_PREFIX || 'canal',
 
-  // Confirma automaticamente e-mails de validacao de encaminhamento recebidos
-  // no inbound tecnico. Por seguranca, apenas links HTTPS em hosts permitidos
-  // sao acessados (padrao: provedores conhecidos de confirmacao).
-  AUTO_CONFIRM_EMAIL_FORWARDING: process.env.AUTO_CONFIRM_EMAIL_FORWARDING !== 'false',
+  // Opt-in: evita que um e-mail recebido dispare requisicoes externas sem configuracao explicita.
+  AUTO_CONFIRM_EMAIL_FORWARDING: process.env.AUTO_CONFIRM_EMAIL_FORWARDING === 'true',
   FORWARDING_CONFIRMATION_ALLOWED_HOSTS: (
     process.env.FORWARDING_CONFIRMATION_ALLOWED_HOSTS || DEFAULT_FORWARDING_CONFIRMATION_ALLOWED_HOSTS.join(',')
   )
@@ -146,37 +159,20 @@ export const env = {
     FROM: process.env.MAIL_FROM || '"Gestifique" <suporte@gestifique.com>',
   },
 
-  // S1: TLS de e-mail. Padrão SEGURO (valida certificado).
-  // Só desative (=true) em ambiente controlado com certificado inválido/self-signed.
   MAIL_TLS_INSECURE: process.env.MAIL_TLS_INSECURE === 'true',
-
-  // Fase 2A (escalabilidade): Redis é OPCIONAL. Sem REDIS_URL o sistema roda em
-  // modo single-instance (comportamento atual). Será usado em fase futura
-  // (Socket.io adapter/emitter e invalidação distribuída de cache).
   REDIS_URL: process.env.REDIS_URL,
-
-  // Envio de e-mail por canal: chave para cifrar credenciais SMTP por empresa/canal.
-  // Obrigatória quando há SMTP por canal configurado (validada no momento do uso).
   ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
-
-  // Fallback de envio de resposta de ticket pelo SMTP GLOBAL do Gestifique.
-  // Padrão SEGURO = false: se o canal não tiver SMTP, a resposta NÃO sai com a
-  // identidade global do SaaS; vira erro controlado. Ative só conscientemente.
   ALLOW_GLOBAL_TICKET_EMAIL_FALLBACK: process.env.ALLOW_GLOBAL_TICKET_EMAIL_FALLBACK === 'true',
   INTERNAL_JOB_TOKEN: process.env.INTERNAL_JOB_TOKEN,
-  ALLOW_INTERNAL_JOB_TOKEN_IN_QUERY: process.env.ALLOW_INTERNAL_JOB_TOKEN_IN_QUERY === 'true',
   APP_TIMEZONE: process.env.APP_TIMEZONE || 'America/Sao_Paulo',
 
-  // Scaling & features
   ENABLE_WEB_SERVER: process.env.ENABLE_WEB_SERVER !== 'false',
   ENABLE_EMAIL_LISTENER: process.env.ENABLE_EMAIL_LISTENER === 'true',
   ENABLE_TICKET_JOBS: process.env.ENABLE_TICKET_JOBS !== 'false',
-  // Em producao, migrations devem rodar em etapa controlada de deploy.
   AUTO_RUN_MIGRATIONS: process.env.AUTO_RUN_MIGRATIONS !== undefined
     ? process.env.AUTO_RUN_MIGRATIONS === 'true'
     : process.env.NODE_ENV !== 'production',
 
-  // Proxy configuration for express-rate-limit compatibility.
   TRUST_PROXY: (() => {
     const val = process.env.TRUST_PROXY;
     if (val === undefined || val === '' || val === 'false' || val === '0') return false;
@@ -191,7 +187,6 @@ export const env = {
       ? '../uploads/tickets'
       : process.env.UPLOAD_DIR,
     PROFILE_PATH: process.env.PROFILE_UPLOAD_DIR,
-    // Reserved for future use
     BUCKET_NAME: process.env.STORAGE_BUCKET_NAME,
     REGION: process.env.STORAGE_REGION,
     ENDPOINT: process.env.STORAGE_ENDPOINT,
@@ -199,7 +194,6 @@ export const env = {
 
   FRONTEND_URL: process.env.FRONTEND_URL || '',
 
-  // Credenciais e kill-switch da Cloud API. Menu/auto-reply vivem em whatsapp_settings (painel).
   WHATSAPP: {
     ENABLED: process.env.ENABLE_WHATSAPP === 'true',
     ACCESS_TOKEN: process.env.WHATSAPP_ACCESS_TOKEN || '',
@@ -212,8 +206,7 @@ export const env = {
   },
 };
 
-// S1: aviso explícito quando a validação TLS de e-mail está desativada.
 if (env.MAIL_TLS_INSECURE) {
   const severity = env.IS_PROD ? 'CRITICAL' : 'WARN';
-  console.warn(`[SECURITY] ${severity}: MAIL_TLS_INSECURE=true desativa validacao TLS do e-mail (SMTP/IMAP). Use apenas em ambiente controlado com certificado invalido.`);
+  console.warn(`[SECURITY] ${severity}: MAIL_TLS_INSECURE=true desativa validacao TLS do e-mail (SMTP/IMAP). Use apenas em ambiente controlado.`);
 }
